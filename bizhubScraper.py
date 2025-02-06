@@ -10,10 +10,9 @@ import warnings
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 warnings.simplefilter("ignore", InsecureRequestWarning)
 
-
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Minimal Bizhub address book fetch: auto-get or use a known cookie, then POST JSON for all entries."
+        description="Minimal Bizhub address book fetch with optional debug output."
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--ip", help="Single IP or hostname.")
@@ -29,10 +28,15 @@ def parse_args():
         action="store_true",
         help="If set, also dump the list of user names (in addition to emails)."
     )
+    parser.add_argument(
+        "-d", "--debug",
+        action="store_true",
+        help="Print debug info, including full responses and cookie details."
+    )
+
     return parser.parse_args()
 
-
-def auto_get_cookie(host):
+def auto_get_cookie(host, debug=False):
     """
     Perform a GET to https://<host>/wcd/index.html to retrieve the device's 'ID' cookie if it auto-assigns one.
     Return a requests.Session if successful, or None on failure.
@@ -41,21 +45,34 @@ def auto_get_cookie(host):
     session = requests.Session()
     try:
         r = session.get(url, verify=False, timeout=10)
+        if debug:
+            print(f"[DEBUG] GET {url} returned status {r.status_code}")
+            print("[DEBUG] Response headers:\n", r.headers)
+            print("[DEBUG] Response body:\n", r.text)
+        
         r.raise_for_status()
+        
         # Check if we got 'ID' in the cookie jar
         if "ID" in session.cookies:
             # Good: we presumably have a valid session cookie
+            if debug:
+                print("[DEBUG] Auto-fetched cookies in session:")
+                for ck in session.cookies:
+                    print("   ", ck.name, "=", ck.value)
             return session
         else:
             # The device didn't set an ID cookie
-            print(f"[!] No 'ID' cookie returned from {url}.")
+            if debug:
+                print(f"[DEBUG] No 'ID' cookie returned from GET {url}. Session cookies:")
+                for ck in session.cookies:
+                    print("   ", ck.name, "=", ck.value)
             return None
     except requests.exceptions.RequestException as e:
-        print(f"[!] Error auto-fetching cookie from {host}: {e}")
+        if debug:
+            print(f"[DEBUG] Error auto-fetching cookie from {host}: {e}")
         return None
 
-
-def fetch_address_book(host, cookie_value=None, session=None):
+def fetch_address_book(host, cookie_value=None, session=None, debug=False):
     """
     POST to /wcd/api/AppReqGetAbbr with minimal data:
       - Only the ID=... cookie if we have it
@@ -74,27 +91,30 @@ def fetch_address_book(host, cookie_value=None, session=None):
 
     # We'll store cookies in a dict if we have a cookie_value. 
     # If a session is provided, we'll rely on session.post(...) so it uses session.cookies.
-    # We do NOT set additional headers since you stated it's not needed.
     
     try:
         if session:
             # Use session cookies
+            if debug:
+                print("[DEBUG] Using auto-fetched session cookies. POSTing to", url)
             resp = session.post(url, data=payload, verify=False, timeout=15)
         else:
-            # Use raw cookie in a dictionary
-            # e.g. {"ID": "somevalue"}
             cookie_dict = {}
             if cookie_value:
-                # We expect the user to have passed something like "ID=abc123..."
-                # If it's exactly that, let's parse out the part after "ID=" if needed.
-                # But if user just gave "abc123..." or "ID=abc123..." 
-                # We'll do a small check:
+                # If the user gave "ID=xyz...", remove "ID=" prefix for requests
                 if cookie_value.startswith("ID="):
                     cookie_value = cookie_value[3:]
-                cookie_value = cookie_value.strip()
-                cookie_dict["ID"] = cookie_value
+                cookie_dict["ID"] = cookie_value.strip()
             
+            if debug:
+                print("[DEBUG] Using raw cookie dict:", cookie_dict)
+                print("[DEBUG] POST", url, "with data:\n", payload)
             resp = requests.post(url, data=payload, cookies=cookie_dict, verify=False, timeout=15)
+
+        if debug:
+            print(f"[DEBUG] POST {url} returned status {resp.status_code}")
+            print("[DEBUG] Response headers:\n", resp.headers)
+            print("[DEBUG] Response body:\n", resp.text)
 
         if resp.status_code == 200:
             # Attempt to parse
@@ -111,7 +131,6 @@ def fetch_address_book(host, cookie_value=None, session=None):
     except requests.exceptions.RequestException as e:
         print(f"[!] Error while fetching address book from {host}: {e}")
         return None
-
 
 def extract_names_and_emails(data):
     """
@@ -145,8 +164,7 @@ def extract_names_and_emails(data):
 
     return names, emails
 
-
-def process_host(host, cookie=None, dump_names=False):
+def process_host(host, cookie=None, dump_names=False, debug=False):
     """
     Handle the retrieval + parsing for a single host.
     """
@@ -158,14 +176,15 @@ def process_host(host, cookie=None, dump_names=False):
     if cookie:
         # Use the user-supplied cookie
         cookie_value = cookie
+        if debug:
+            print(f"[DEBUG] Using user-supplied cookie: {cookie_value}")
     else:
-        # Attempt auto-fetch
-        session = auto_get_cookie(host)
+        session = auto_get_cookie(host, debug=debug)
         if not session:
             print(f"[!] Could not retrieve an ID cookie automatically from {host}. Skipping.")
             return
 
-    data = fetch_address_book(host, cookie_value=cookie_value, session=session)
+    data = fetch_address_book(host, cookie_value=cookie_value, session=session, debug=debug)
     if not data:
         print(f"[!] No data returned for {host}.")
         return
@@ -173,7 +192,6 @@ def process_host(host, cookie=None, dump_names=False):
     names, emails = extract_names_and_emails(data)
     unique_names = sorted(set(names))
     unique_emails = sorted(set(emails))
-    total_records = len(unique_emails)
 
     if not unique_emails and not unique_names:
         print(f"    [!] Found no email addresses and no names.")
@@ -198,13 +216,12 @@ def process_host(host, cookie=None, dump_names=False):
                 f.write(nm + "\n")
         print(f"    -> Names saved to: {names_filename}")
 
-
 def main():
     args = parse_args()
 
     # Single IP
     if args.ip:
-        process_host(args.ip, cookie=args.cookie, dump_names=args.names)
+        process_host(args.ip, cookie=args.cookie, dump_names=args.names, debug=args.debug)
     
     # Multiple IPs in a file
     elif args.list:
@@ -216,8 +233,7 @@ def main():
                 host = line.strip()
                 if not host:
                     continue
-                process_host(host, cookie=args.cookie, dump_names=args.names)
-
+                process_host(host, cookie=args.cookie, dump_names=args.names, debug=args.debug)
 
 if __name__ == "__main__":
     main()
