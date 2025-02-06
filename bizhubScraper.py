@@ -1,176 +1,152 @@
 #!/usr/bin/env python3
 import argparse
-import json
 import requests
+import json
 import sys
 import os
 import warnings
 
-# Suppress "InsecureRequestWarning: Unverified HTTPS request is being made..." 
+# Suppress InsecureRequestWarning about verify=False
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 warnings.simplefilter("ignore", InsecureRequestWarning)
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(
-        description="Retrieve and parse the Konica Bizhub address book from one or more hosts."
-    )
-    
-    # Create a mutually exclusive group so user can either supply an IP or a file, but not both
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("-i", "--ip", help="Single IP or hostname.")
-    group.add_argument("-l", "--list", help="File containing a list of IPs/hosts (one per line).")
 
-    parser.add_argument(
-        "-c", "--cookie",
-        help="Optional cookie string for the Bizhub session if needed (e.g. 'ID=abcdef123...').",
-        default=None
-    )
-    parser.add_argument(
-        "-n", "--names",
-        action="store_true",
-        help="If set, also dump the list of user names to bizhub-addrBk_names_<ip>.txt"
-    )
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Attempt a fully replicated Bizhub request to retrieve the address book.")
+    parser.add_argument("-i", "--ip", required=True, help="IP or hostname of the Bizhub device.")
+    parser.add_argument("-c", "--cookie", default=None,
+                        help="Raw cookie string from your browser dev tools (everything after 'Cookie:').")
+    parser.add_argument("-f", "--formdata", default=None,
+                        help="Raw form data if the POST body is not empty. E.g. 'gAbbrStatus=0&someOtherKey=val'")
+    parser.add_argument("-n", "--names", action="store_true",
+                        help="Also output names (in addition to emails).")
+    parser.add_argument("--user-agent", default="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+                        help="User-Agent string to send. Default mimics a modern Firefox.")
+    parser.add_argument("--referer", default=None, help="Referer header to send.")
+    parser.add_argument("--origin", default=None, help="Origin header to send.")
     return parser.parse_args()
 
-def get_address_book_data(ip, cookie=None):
-    """
-    Performs a POST request to https://<ip>/wcd/api/AppReqGetAbbr
-    and returns parsed JSON (a dictionary) or None if an error occurs.
-    """
-    url = f"https://{ip}/wcd/api/AppReqGetAbbr"
-
-    # Minimal headers that often suffice for this endpoint
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "X-Requested-With": "XMLHttpRequest",
-        "Accept": "application/json, text/javascript",
-    }
-    
-    # Prepare cookies if user supplies -c/--cookie
-    cookies = {}
-    if cookie:
-        # User might pass "ID=abcdef123..."
-        # We'll parse that to put it in the cookies dictionary.
-        # If multiple name=value pairs are needed, expand this logic.
-        try:
-            name_val = cookie.split("=", 1)
-            cookies[name_val[0]] = name_val[1]
-        except IndexError:
-            print("[!] Cookie format error; expected something like 'ID=abcdef123...'.", file=sys.stderr)
-            return None
-    
-    try:
-        # Some printers accept an empty POST body or an empty form
-        response = requests.post(
-            url,
-            headers=headers,
-            data={},             # or data="" if truly no body needed
-            cookies=cookies,
-            verify=False,        # ignoring SSL cert errors (self-signed likely)
-            timeout=15
-        )
-        if response.status_code == 200:
-            # Printer often returns large single-line JSON
-            return json.loads(response.text)
-        else:
-            print(f"[!] Received unexpected HTTP status code {response.status_code} from {ip}", file=sys.stderr)
-            return None
-    except requests.exceptions.RequestException as e:
-        print(f"[!] Error connecting to {ip}: {e}", file=sys.stderr)
-        return None
 
 def extract_names_and_emails(data):
     """
     Given the parsed JSON from the Bizhub address book,
-    return two lists (or sets): (names, emails).
+    return two lists: (names, emails).
     """
     names = []
     emails = []
     
-    # Typically the address book is in data["AbbrList"]["Abbr"]
+    # Some firmwares store data in data["AbbrList"]["Abbr"]
+    # Others may differ. Adjust as needed.
     try:
         abbr_list = data["AbbrList"]["Abbr"]
     except (KeyError, TypeError):
-        # Possibly no data or unexpected structure
         return names, emails
     
     for entry in abbr_list:
-        # "Name" is top-level in each entry.
         name = entry.get("Name", "").strip()
-        
-        # "To" is typically in entry["SendConfiguration"]["AddressInfo"]["EmailMode"]["To"]
+        # Typically "To" is in entry["SendConfiguration"]["AddressInfo"]["EmailMode"]["To"]
+        to_email = ""
         try:
             to_email = entry["SendConfiguration"]["AddressInfo"]["EmailMode"]["To"].strip()
         except (KeyError, AttributeError):
-            to_email = ""
+            pass
 
         if name:
             names.append(name)
         if to_email:
             emails.append(to_email)
-    
+
     return names, emails
 
-def write_to_file(filename, items):
-    """
-    Write each item on its own line to the specified filename.
-    """
-    with open(filename, "w", encoding="utf-8") as f:
-        for item in items:
-            f.write(item + "\n")
-
-def process_single_host(ip, cookie=None, dump_names=False):
-    print(f"[*] Retrieving address book for host: {ip}")
-    data = get_address_book_data(ip, cookie)
-    if data is None:
-        print(f"[!] No data retrieved from {ip}.")
-        return  # Could not retrieve/parse
-    
-    names, emails = extract_names_and_emails(data)
-    unique_names = sorted(set(names))
-    unique_emails = sorted(set(emails))
-    
-    # If there's no data at all, skip file creation.
-    if not unique_emails and not unique_names:
-        print(f"[!] No valid address records found for {ip}. Skipping file creation.")
-        return
-
-    # Otherwise, we found something. Print summary:
-    print(f"    Found {len(unique_names)} unique names.")
-    print(f"    Found {len(unique_emails)} unique email addresses.")
-
-    # If we have emails, write them to file
-    if unique_emails:
-        email_filename = f"bizhub-addrBk_emailAddr_{ip}.txt"
-        write_to_file(email_filename, unique_emails)
-        print(f"    Email addresses saved to: {email_filename}")
-    
-    # If dump_names and we have names, write them
-    if dump_names and unique_names:
-        names_filename = f"bizhub-addrBk_names_{ip}.txt"
-        write_to_file(names_filename, unique_names)
-        print(f"    Names saved to: {names_filename}")
-
-    print("---------------------------------------\n")
 
 def main():
     args = parse_arguments()
+    ip = args.ip
+
+    # If user didn't provide an --origin, we can default to https://<ip>
+    origin = args.origin if args.origin else f"https://{ip}"
+    # If user didn't provide a --referer, we can default to the spa_main.html path
+    referer = args.referer if args.referer else f"https://{ip}/wcd/spa_main.html"
     
-    # If user passes -i/--ip, handle just that host
-    if args.ip:
-        process_single_host(args.ip, args.cookie, args.names)
+    # Build the URL
+    url = f"https://{ip}/wcd/api/AppReqGetAbbr"
     
-    # If user passes -l/--list, read IPs from the file line by line
-    if args.list:
-        if not os.path.isfile(args.list):
-            print(f"[!] The file {args.list} does not exist.")
-            sys.exit(1)
-        
-        with open(args.list, "r", encoding="utf-8") as f:
-            for line in f:
-                ip = line.strip()
-                if ip:
-                    process_single_host(ip, args.cookie, args.names)
+    # Build the headers.  
+    # NOTE: If your dev tools show more headers, add them here (Accept-Language, Accept-Encoding, etc).
+    headers = {
+        "User-Agent": args.user_agent,
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Origin": origin,
+        "Referer": referer,
+    }
+    
+    # If user has a raw cookie string, put it in the "Cookie" header.
+    # e.g. "selno=En; lang=En; vm=Html; ID=...; bv=Firefox/128.0; ..."
+    if args.cookie:
+        headers["Cookie"] = args.cookie
+
+    # The form data (body). If not given, we default to empty string.
+    # But on some devices you absolutely must pass something that the dev tools show.
+    form_data = args.formdata if args.formdata else ""
+
+    print(f"[*] Sending POST to {url}")
+    print(f"[*] Using Cookie: {args.cookie}")
+    print(f"[*] Using Form Data: {form_data}\n")
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            data=form_data,
+            verify=False,
+            timeout=15
+        )
+        print(f"[+] HTTP {response.status_code} received.\n")
+        if response.status_code == 200:
+            # Attempt to parse JSON
+            try:
+                data_json = response.json()
+            except json.JSONDecodeError:
+                print("[!] The response body does not appear to be valid JSON.")
+                print("[!] Response body snippet:\n", response.text[:500])
+                sys.exit(1)
+            
+            # Extract names and emails
+            names, emails = extract_names_and_emails(data_json)
+            unique_names = sorted(set(names))
+            unique_emails = sorted(set(emails))
+
+            if not unique_names and not unique_emails:
+                print("[!] No address book data found or the device returned an empty set.")
+                sys.exit(0)
+            
+            print(f"Found {len(unique_names)} unique names.")
+            print(f"Found {len(unique_emails)} unique emails.")
+
+            # Write emails to file
+            if unique_emails:
+                email_filename = f"bizhub-addrBk_emailAddr_{ip}.txt"
+                with open(email_filename, "w", encoding="utf-8") as f:
+                    for e in unique_emails:
+                        f.write(e + "\n")
+                print(f"[+] Email addresses written to: {email_filename}")
+
+            # Optionally write names
+            if args.names and unique_names:
+                names_filename = f"bizhub-addrBk_names_{ip}.txt"
+                with open(names_filename, "w", encoding="utf-8") as f:
+                    for n in unique_names:
+                        f.write(n + "\n")
+                print(f"[+] Names written to: {names_filename}")
+        else:
+            print(f"[!] Received HTTP {response.status_code} instead of 200.")
+            print("    Response text (partial):", response.text[:500])
+    except requests.exceptions.RequestException as e:
+        print(f"[!] Error while connecting or sending request: {e}")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
