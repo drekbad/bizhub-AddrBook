@@ -10,8 +10,8 @@ requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.
 
 CHUNK_SIZE = 50  # For HTTPS chunked queries
 
-def get_cookie(ip, use_https=False, debug=False):
-    """Retrieve session cookie from the printer's index page, retrying with HTTPS if HTTP fails."""
+def get_cookie(ip, use_https=True, debug=False):
+    """Retrieve session cookie from the printer's index page, preferring HTTPS first."""
     protocol = "https" if use_https else "http"
     url = f"{protocol}://{ip}/wcd/index.html"
 
@@ -29,19 +29,19 @@ def get_cookie(ip, use_https=False, debug=False):
                 print(f"[DEBUG] No cookie received from {protocol}://{ip}")
             return None
 
-    except requests.exceptions.SSLError:
-        if not use_https:
-            print(f"[!] SSL error on {ip}, retrying with HTTPS...")
-            return get_cookie(ip, use_https=True, debug=debug)
+    except requests.exceptions.ConnectionError:
+        if use_https:
+            print(f"[!] Connection failed on HTTPS for {ip}, retrying with HTTP...")
+            return get_cookie(ip, use_https=False, debug=debug)
         else:
-            print(f"[X] SSL error on HTTPS for {ip}, skipping...")
+            print(f"[X] Connection failed on HTTP for {ip}, skipping...")
             return None
     except requests.exceptions.RequestException as e:
         if debug:
             print(f"[DEBUG] Failed to reach {protocol}://{ip}: {e}")
         return None
 
-def get_address_book(ip, cookie, use_https=False, debug=False):
+def get_address_book(ip, cookie, use_https=True, debug=False):
     """Request the address book in XML or JSON format, depending on HTTP vs. HTTPS."""
     protocol = "https" if use_https else "http"
     url = f"{protocol}://{ip}/wcd/abbr.xml"
@@ -57,16 +57,16 @@ def get_address_book(ip, cookie, use_https=False, debug=False):
             return get_address_book_json(ip, cookie, debug)
 
         if debug:
-            print(f"[DEBUG] Retrieved address book from {protocol}://{ip}, length: {len(response.text)}")
+            print(f"[DEBUG] Retrieved XML address book from {protocol}://{ip}, length: {len(response.text)}")
 
         return response.text
 
-    except requests.exceptions.SSLError:
-        if not use_https:
-            print(f"[!] SSL error retrieving XML from {ip}, retrying with HTTPS...")
-            return get_address_book(ip, cookie, use_https=True, debug=debug)
+    except requests.exceptions.ConnectionError:
+        if use_https:
+            print(f"[!] Connection failed retrieving XML from {ip}, retrying with HTTP...")
+            return get_address_book(ip, cookie, use_https=False, debug=debug)
         else:
-            print(f"[X] SSL error retrieving XML from {ip} over HTTPS, skipping...")
+            print(f"[X] Connection failed retrieving XML from {ip} over HTTP, skipping...")
             return None
     except requests.exceptions.RequestException as e:
         if debug:
@@ -77,6 +77,7 @@ def get_address_book_json(ip, cookie, debug=False):
     """Attempt JSON-based address book retrieval (used in HTTPS)."""
     url = f"https://{ip}/wcd/api/AppReqGetAbbr"
     headers = {'Cookie': cookie}
+    
     payload = {
         "AbbrListCondition": {
             "WellUse": "false",
@@ -107,7 +108,7 @@ def get_address_book_json(ip, cookie, debug=False):
         return None
 
 def parse_xml(xml_data, ip, debug=False):
-    """Extract Name and Email from XML response."""
+    """Extract Name and Email from XML response, ensuring data is within <AddressBook>."""
     parsed_data = []
     
     try:
