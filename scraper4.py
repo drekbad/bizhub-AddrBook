@@ -53,7 +53,7 @@ def get_address_book(ip, cookie, protocol, debug=False):
         if "<html" in response.text[:100].lower():
             if debug:
                 print(f"[DEBUG] Received unexpected HTML from {url}, attempting JSON endpoint...")
-            return get_address_book_json(ip, cookie, debug)
+            return None
 
         if debug:
             print(f"[DEBUG] Retrieved XML address book from {protocol}://{ip}, length: {len(response.text)}")
@@ -73,25 +73,32 @@ def get_address_book(ip, cookie, protocol, debug=False):
         return None
 
 def parse_xml(xml_data, ip, debug=False):
-    """Extract Name and Email from XML response, ensuring data is within <Address>."""
+    """Extract Name and Email from XML response, ensuring data is within <Address> → <AbbrList>."""
     parsed_data = []
     
     try:
         root = ET.fromstring(xml_data)
-        address_block = root.find(".//Address")
+        address_block = root.find(".//Address/AbbrList")
 
         if address_block is None:
             if debug:
-                print(f"[DEBUG] No <Address> tag found for {ip}. Full response:\n{xml_data[:500]}")
+                print(f"[DEBUG] No <AbbrList> tag found within <Address> for {ip}. Full response:\n{xml_data[:500]}")
             return []
 
         for addr in address_block.findall(".//AddressKind"):
-            name = addr.find("Name").text if addr.find("Name") is not None else "Unknown"
+            name_element = addr.find("Name")
+            name = name_element.text.strip() if name_element is not None else "Unknown"
+
             send_config = addr.find("SendConfiguration")
             email = "No Email"
             if send_config is not None:
-                email = send_config.find("To").text if send_config.find("To") is not None else "No Email"
+                to_element = send_config.find("To")
+                email = to_element.text.strip() if to_element is not None else "No Email"
+
             parsed_data.append((name, email))
+
+            if debug:
+                print(f"[DEBUG] Extracted Name: {name}, Email: {email}")
 
         return parsed_data
 
