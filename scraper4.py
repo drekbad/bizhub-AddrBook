@@ -2,17 +2,16 @@
 import argparse
 import requests
 import sys
-import json
 import os
 import xml.etree.ElementTree as ET
 
-# Suppress the "InsecureRequestWarning" about verify=False
+# Suppress "InsecureRequestWarning" about verify=False
 import warnings
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 warnings.simplefilter("ignore", InsecureRequestWarning)
 
-CHUNK_SIZE = 50  # The number of entries requested per iteration
-MAX_ENTRIES = 2000  # The max limit the device supports
+CHUNK_SIZE = 50  # Fetch records in increments of 50
+MAX_ENTRIES = 2000  # Max limit the device supports
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fetch full address book from internal network printers (Bizhub).")
@@ -39,73 +38,77 @@ def auto_get_cookie(host, debug=False):
                 cookie_value = session.cookies.get_dict().get("ID", "")
                 if debug:
                     print(f"[DEBUG] Auto-fetched cookie over {protocol.upper()} for {host}: ID={cookie_value}")
-                return session, protocol, cookie_value  # Return session, protocol, and cookie value
+                return session, protocol, cookie_value
 
         except requests.exceptions.RequestException as e:
             if debug:
                 print(f"[DEBUG] Error fetching cookie from {protocol}://{host}: {e}")
-            continue  # Try the next protocol
+            continue  
 
     print(f"[!] Failed to retrieve an ID cookie over both HTTPS and HTTP for {host}.")
     return None, None, None
 
-def fetch_abbr_chunk(host, protocol, session=None, cookie_value=None, start=1, end=50, debug=False):
-    """Fetch a range of entries (start-end) from /wcd/abbr.xml."""
+def fetch_abbr_chunk(host, protocol, session, cookie_value, debug=False):
+    """Fetch the current page of records from /wcd/abbr.xml."""
     url = f"{protocol}://{host}/wcd/abbr.xml"
     headers = {"Cookie": f"ID={cookie_value}"} if cookie_value else {}
 
     try:
-        if session:
-            if debug:
-                print(f"[DEBUG] Fetching {start}-{end} using session cookie over {protocol.upper()}.")
-            resp = session.get(url, headers=headers, verify=False, timeout=15)
-        else:
-            if debug:
-                print(f"[DEBUG] Fetching {start}-{end} over {protocol.upper()} with headers:", headers)
-            resp = requests.get(url, headers=headers, verify=False, timeout=15)
+        resp = session.get(url, headers=headers, verify=False, timeout=15)
 
         if debug:
             print(f"[DEBUG] Response status: {resp.status_code}")
             print(f"[DEBUG] Response body (first 1000 chars):\n{resp.text[:1000]}")
 
         if resp.status_code == 200:
-            return resp.text  # Return raw XML response
-        else:
-            if debug:
-                print("[DEBUG] Non-200 status code:", resp.status_code)
-                print("[DEBUG] Body snippet:", resp.text[:300])
-            return None
+            return resp.text  
+        return None
+
     except requests.exceptions.RequestException as e:
         if debug:
             print(f"[DEBUG] RequestException fetching XML: {e}")
         return None
 
+def request_next_page(host, protocol, session, cookie_value, start, end, debug=False):
+    """Send a POST request to /user.cgi to load the next page of users."""
+    url = f"{protocol}://{host}/wcd/user.cgi"
+    headers = {"Cookie": f"ID={cookie_value}", "Content-Type": "application/x-www-form-urlencoded"}
+    data = f"func=PSL_C_ABR_PAG&H_SRT={start}&H_END={end}&H_AKI=Public&H_FAV=&S_SCON=No&S_ORD=Ascending"
+
+    try:
+        resp = session.post(url, headers=headers, data=data, verify=False, timeout=15)
+
+        if debug:
+            print(f"[DEBUG] POST {url} -> status {resp.status_code}")
+            print(f"[DEBUG] POST response body (first 400 chars):\n{resp.text[:400]}")
+
+        return resp.status_code == 200  
+    except requests.exceptions.RequestException as e:
+        if debug:
+            print(f"[DEBUG] RequestException posting to user.cgi: {e}")
+        return False
+
 def parse_xml(xml_data, debug=False):
-    """Extract Name and Email from the XML response correctly."""
+    """Extract Name and Email from the XML response."""
     try:
         root = ET.fromstring(xml_data)
-
-        # Locate <Address>
         address_section = root.find(".//Address")
         if address_section is None:
             if debug:
-                print(f"[DEBUG] No <Address> block found in XML.")
-                print(f"[DEBUG] XML Response snippet:\n{xml_data[:1000]}")
+                print("[DEBUG] No <Address> block found.")
             return []
 
         abbr_list = address_section.find("AbbrList")
         if abbr_list is None:
             if debug:
-                print(f"[DEBUG] No <AbbrList> found inside <Address>.")
+                print("[DEBUG] No <AbbrList> found inside <Address>.")
             return []
 
         parsed_data = []
         for abbr in abbr_list.findall("Abbr"):
-            # Get Name
             name_element = abbr.find("Name")
             name = name_element.text.strip() if name_element is not None else "Unknown"
 
-            # Get Email
             send_config = abbr.find("SendConfiguration")
             email = "No Email"
             if send_config is not None:
@@ -129,26 +132,35 @@ def parse_xml(xml_data, debug=False):
         return []
 
 def fetch_all_abbr(host, protocol, session, cookie_value, debug=False):
-    """Fetch the entire address book by iterating in chunks of CHUNK_SIZE (50)."""
+    """Fetch the full address book by iterating in increments of CHUNK_SIZE (50)."""
     all_records = []
     for start in range(1, MAX_ENTRIES + 1, CHUNK_SIZE):
         end = start + CHUNK_SIZE - 1
-        xml_data = fetch_abbr_chunk(host, protocol, session, cookie_value, start, end, debug=debug)
+
+        xml_data = fetch_abbr_chunk(host, protocol, session, cookie_value, debug=debug)
         if not xml_data:
-            break  # Stop if no response received
+            break  
 
         parsed_data = parse_xml(xml_data, debug=debug)
         if not parsed_data:
             if debug:
                 print(f"[DEBUG] No records found in range {start}-{end}, stopping iteration.")
-            break  # Stop if no records exist in this chunk
+            break  
 
         all_records.extend(parsed_data)
+
+        if end >= MAX_ENTRIES:
+            break  
+
+        if not request_next_page(host, protocol, session, cookie_value, start+CHUNK_SIZE, end+CHUNK_SIZE, debug=debug):
+            if debug:
+                print(f"[DEBUG] Failed to request next page for {start+CHUNK_SIZE}-{end+CHUNK_SIZE}.")
+            break  
 
     return all_records
 
 def process_host(host, debug=False):
-    """Handles the full address book extraction for a single host."""
+    """Handles full address book extraction for a single host."""
     session, protocol, cookie_value = auto_get_cookie(host, debug=debug)
     if not session:
         return
@@ -168,7 +180,6 @@ def process_host(host, debug=False):
 
 def main():
     parser = parse_args()
-
     hosts = [parser.ip] if parser.ip else open(parser.list).read().splitlines()
 
     for host in hosts:
