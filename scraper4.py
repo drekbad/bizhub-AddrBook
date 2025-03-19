@@ -99,17 +99,21 @@ def parse_xml(xml_data, debug=False):
             return []
 
         parsed_data = []
-        for addr in abbr_list.findall("AddressKind"):
+        for abbr in abbr_list.findall("Abbr"):
             # Get Name
-            name_element = addr.find("Name")
+            name_element = abbr.find("Name")
             name = name_element.text.strip() if name_element is not None else "Unknown"
 
             # Get Email
-            send_config = addr.find("SendConfiguration")
+            send_config = abbr.find("SendConfiguration")
             email = "No Email"
             if send_config is not None:
-                to_element = send_config.find("To")
-                email = to_element.text.strip() if to_element is not None else "No Email"
+                address_info = send_config.find("AddressInfo")
+                if address_info is not None:
+                    email_mode = address_info.find("EmailMode")
+                    if email_mode is not None:
+                        to_element = email_mode.find("To")
+                        email = to_element.text.strip() if to_element is not None else "No Email"
 
             parsed_data.append((name, email))
 
